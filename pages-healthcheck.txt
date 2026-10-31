@@ -1,0 +1,2 @@
+Shortlist GitHub Pages deployment check — 2026-10-31.
+This file is safe to remove after the site works.
