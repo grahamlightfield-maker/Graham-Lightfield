@@ -520,6 +520,7 @@ var AK = (function () {
   AK.keyReady = function () { return AK.IN_CLAUDE || (AK.usingGemini() ? !!AK.state.settings.geminiKey : !!AK.state.settings.apiKey); };
   AK.canWebResearch = function () { return !AK.usingGemini(); };
   AK.KEYS = { profile: "kit-profile", settings: "kit-settings", apps: "kit-apps" };
+  AK.GEMINI_HOME_REV = "gemini-home-v2";
   AK.STATUSES = ["Saved", "Applied", "Emailed", "Follow-up sent", "Interviewing", "Offer", "Rejected", "Closed"];
 
   AK.store = {
@@ -2291,7 +2292,7 @@ var AK = (function () {
     var m = AK.$("mode"); m.innerHTML = "";
     var ok = AK.keyReady();
     m.appendChild(h("span", { class: "dot" + (ok ? "" : " off") }));
-    m.appendChild(document.createTextNode(AK.IN_CLAUDE ? "Running inside Claude" : (ok ? (AK.usingGemini() ? "Gemini key saved" : "Claude key saved") : "Add an AI API key in Settings")));
+    m.appendChild(document.createTextNode(AK.IN_CLAUDE ? "Running inside Claude" : (ok ? (AK.usingGemini() ? "Gemini connected" : "Claude key saved") : (AK.usingGemini() ? "Connect free Gemini in Me → Settings" : "Connect your Claude key in Me → Settings"))));
     var sub = AK.$("logoSub"); if (sub) sub.textContent = S.profile.name ? S.profile.name.split(" ")[0] + "'s internship search" : "Internship search";
   };
 
@@ -3074,11 +3075,11 @@ var AK = (function () {
 
   AK.viewSettings = function (root, bar) {
     var s = S.settings;
-    root.appendChild(AK.pageHead("Me", AK.IN_CLAUDE ? "This copy runs inside Claude, so it doesn't need an API key." : "Choose a free Gemini model or use your own Claude API key."));
+    root.appendChild(AK.pageHead("Me", AK.IN_CLAUDE ? "This copy runs inside Claude, so it doesn't need an API key." : "Free Gemini edition. Google Gemini is the default; no paid Claude API key required."));
     if (bar) root.appendChild(bar);
     var cols = h("div", { class: "cols" });
     if (!AK.IN_CLAUDE) {
-      if (!s.provider) s.provider = s.apiKey ? "claude" : "gemini";
+      if (!s.provider) s.provider = "gemini";
       var gemini = s.provider === "gemini";
       var provider = h("select", { id: "setProvider" },
         h("option", { value: "gemini", text: "Google Gemini (free tier)" }),
@@ -3154,8 +3155,15 @@ var AK = (function () {
     else if (res[0]) S.profile = Object.assign({}, AK.DEFAULT_PROFILE, res[0]);
     if (res[1]) {
       var saved = res[1];
-      // Existing users who already saved a Claude key keep Claude selected until they choose Gemini.
-      if (!saved.provider) saved.provider = saved.apiKey ? "claude" : "gemini";
+      // Migrate the older Claude-only website into the free Gemini edition exactly once.
+      // This changes only the selected provider, not the profile, jobs, or saved keys.
+      // Future manual provider changes persist after the migration.
+      if (!AK.IN_CLAUDE && saved.geminiHomeRevision !== AK.GEMINI_HOME_REV) {
+        saved.provider = "gemini";
+        saved.geminiHomeRevision = AK.GEMINI_HOME_REV;
+        AK.store.set(AK.KEYS.settings, saved);
+      }
+      if (!saved.provider) saved.provider = "gemini";
       var keep = AK.IN_CLAUDE ? { apiKey: "", geminiKey: "" } : {};
       S.settings = Object.assign(S.settings, saved, keep);
     }
