@@ -508,10 +508,17 @@ var AK = (function () {
   AK.IN_CLAUDE = !!(window.storage && typeof window.storage.get === "function" && typeof window.storage.set === "function");
   AK.CLAUDE_MODEL_IN_APP = "claude-sonnet-4-6";
   AK.MODELS = [
-    ["claude-sonnet-5-5", "Claude Sonnet 5.5 (recommended)"],
-    ["claude-haiku-5-5", "Claude Haiku 5.5 (fastest, cheapest)"],
-    ["claude-opus-5-5", "Claude Opus 5.5 (strongest writing)"]
+    ["claude-sonnet-5-5", "Claude Sonnet 5.5"],
+    ["claude-haiku-5-5", "Claude Haiku 5.5"],
+    ["claude-opus-5-5", "Claude Opus 5.5"]
   ];
+  AK.GEMINI_MODELS = [
+    ["gemini-3.8-flash", "Gemini 3.8 Flash (free tier, recommended)"],
+    ["gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (free tier, lighter)"]
+  ];
+  AK.usingGemini = function () { return !AK.IN_CLAUDE && AK.state.settings.provider === "gemini"; };
+  AK.keyReady = function () { return AK.IN_CLAUDE || (AK.usingGemini() ? !!AK.state.settings.geminiKey : !!AK.state.settings.apiKey); };
+  AK.canWebResearch = function () { return !AK.usingGemini(); };
   AK.KEYS = { profile: "kit-profile", settings: "kit-settings", apps: "kit-apps" };
   AK.STATUSES = ["Saved", "Applied", "Emailed", "Follow-up sent", "Interviewing", "Offer", "Rejected", "Closed"];
 
@@ -543,7 +550,7 @@ var AK = (function () {
   };
   AK.state = {
     profile: Object.assign({}, AK.DEFAULT_PROFILE),
-    settings: { apiKey: "", model: AK.MODELS[0][0], research: true, living: true, intel: true, contact: true, concurrency: AK.IN_CLAUDE ? 1 : 2 },
+    settings: { provider: "gemini", geminiKey: "", geminiModel: AK.GEMINI_MODELS[0][0], apiKey: "", model: AK.MODELS[0][0], research: true, living: true, intel: true, contact: true, concurrency: AK.IN_CLAUDE ? 1 : 2 },
     apps: [],
     route: { view: "dashboard", id: null, tab: "apply" },
     form: { posting: "", link: "", website: "", contact: "", showContact: false },
@@ -699,7 +706,40 @@ var AK = (function () {
     };
     return go();
   };
+  function sendGemini(opts) {
+    var s = AK.state.settings;
+    if (!s.geminiKey) return Promise.reject(new UserError("Add a Gemini API key in Me > Settings first."));
+    if (opts.search) return Promise.reject(new UserError("Verified web research needs a separate search service. The free Gemini model can write from job postings but cannot search the live web in Shortlist."));
+    var model = AK.GEMINI_MODELS.some(function (m) { return m[0] === s.geminiModel; }) ? s.geminiModel : AK.GEMINI_MODELS[0][0];
+    var request = {
+      systemInstruction: { parts: [{ text: opts.system || "You are a helpful internship application assistant." }] },
+      contents: [{ role: "user", parts: [{ text: opts.user || "" }] }],
+      generationConfig: { maxOutputTokens: Math.max(4096, Math.min(8192, opts.maxTokens || 1800)), temperature: 0.3 }
+    };
+    return fetch("https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(model) + ":generateContent", {
+      method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": s.geminiKey }, body: JSON.stringify(request)
+    }).catch(function () { throw new UserError("Couldn't reach Gemini. Check your internet and whether your browser permits API requests."); })
+      .then(function (res) { return res.json().catch(function () { return null; }).then(function (data) {
+        if (!res.ok) {
+          var msg = data && data.error && data.error.message || "";
+          var friendly = res.status === 400 ? "Gemini rejected the request. " + msg :
+            res.status === 401 || res.status === 403 ? "Gemini rejected your key or project permissions. Check your key in Google AI Studio. " + msg :
+            res.status === 404 ? "This Gemini model isn't available for your project. Try the other free model in Settings." :
+            res.status === 429 ? "Gemini's free-tier limit was reached. Wait for your quota to reset, or try later." :
+            "Gemini returned an error (" + res.status + "). " + msg;
+          var err = new UserError(friendly.trim());
+          if (res.status === 429 || res.status === 503) { err.rateLimited = true; var ra = parseFloat(res.headers.get("retry-after")); err.retryAfter = isFinite(ra) ? ra : null; }
+          throw err;
+        }
+        var candidate = data && data.candidates && data.candidates[0];
+        var parts = candidate && candidate.content && candidate.content.parts || [];
+        var result = parts.filter(function (p) { return typeof p.text === "string"; }).map(function (p) { return p.text; }).join("\n");
+        if (!result.trim()) throw new UserError("Gemini returned an empty answer. Try again or choose another model.");
+        return { text: result, sources: [], stop: candidate && candidate.finishReason, blocks: parts };
+      }); });
+  }
   function send(opts) {
+    if (AK.usingGemini()) return sendGemini(opts);
     var s = AK.state.settings;
     var headers = { "Content-Type": "application/json" };
     var body = {
@@ -778,11 +818,11 @@ var AK = (function () {
   AK.parseJSON = function (text, allowPartial) {
     var clean = String(text).replace(/```json|```/g, "").trim();
     var a = clean.indexOf("{");
-    if (a < 0) throw new UserError("Claude's answer wasn't in the expected format. Try again.");
+    if (a < 0) throw new UserError("The AI answer wasn't in the expected JSON format. Try again.");
     var body = clean.slice(a), b = body.lastIndexOf("}");
     if (b > 0) { try { return JSON.parse(body.slice(0, b + 1)); } catch (e) { } }
     if (allowPartial) { var fixed = AK.repairJSON(body); if (fixed) { fixed.__partial = true; return fixed; } }
-    throw new UserError("Claude's answer was cut off. Try again.");
+    throw new UserError("The AI answer was cut off. Try again.");
   };
   // Ask for JSON. If the reply is cut off, retry once asking for a shorter answer,
   // and if that is cut off too, keep every complete field from the longer reply.
@@ -797,7 +837,8 @@ var AK = (function () {
           catch (e2) {
             var s2 = null; try { s2 = AK.parseJSON(r2.text, true); } catch (x) { }
             var best = s2 || salvage;
-            if (best) { best.__sources = r2.sources.length ? r2.sources : r.sources; return best; }            throw e2;
+            if (best) { best.__sources = r2.sources.length ? r2.sources : r.sources; return best; }
+            throw e2;
           }
         });
       }
@@ -1524,7 +1565,7 @@ var AK = (function () {
       if (!a.website && a.kit.website) a.website = a.kit.website;
       AK.onChange(a.id);
       step(a, rewrite ? "Rewriting with your suggestions" : "Scoring your fit");
-      var web = S.settings.research !== false && (!rewrite || !!opts.research);
+      var web = AK.canWebResearch() && S.settings.research !== false && (!rewrite || !!opts.research);
       var fitP = AK.ask({ system: AK.SYSTEM, user: promptFit(a), maxTokens: 1800 })
         .then(function (r) { mergeFit(a.kit, r); }).catch(function (e) { a.kit.fit_error = e.message; })
         .then(function () { markDone(a, "analyze"); });
@@ -1596,7 +1637,8 @@ var AK = (function () {
     size = size || 84;
     var r = size / 2 - 7, c = 2 * Math.PI * r, v = value === null || value === undefined ? null : Math.max(0, Math.min(100, value));
     var label = v === null ? "–" : String(v);
-    var el = svg("svg", { class: "ring", width: size, height: size, viewBox: "0 0 " + size + " " + size, role: "img", "aria-label": v === null ? "Fit score not available" : "Fit score " + v + " out of 100" }, [      svg("circle", { cx: size / 2, cy: size / 2, r: r, fill: "none", stroke: "var(--surface-3)", "stroke-width": 8 }),
+    var el = svg("svg", { class: "ring", width: size, height: size, viewBox: "0 0 " + size + " " + size, role: "img", "aria-label": v === null ? "Fit score not available" : "Fit score " + v + " out of 100" }, [
+      svg("circle", { cx: size / 2, cy: size / 2, r: r, fill: "none", stroke: "var(--surface-3)", "stroke-width": 8 }),
       v === null ? null : svg("circle", { cx: size / 2, cy: size / 2, r: r, fill: "none", stroke: colorFor(v), "stroke-width": 8, "stroke-linecap": "round",
         "stroke-dasharray": (c * v / 100) + " " + c, transform: "rotate(-90 " + size / 2 + " " + size / 2 + ")" }),
       svg("text", { x: "50%", y: "50%", "text-anchor": "middle", "dominant-baseline": "central", style: "font-size:" + Math.round(size * 0.3) + "px;font-weight:800;fill:var(--ink)" }, [label])
@@ -2244,12 +2286,12 @@ var AK = (function () {
     var paused = AK.rate && AK.rate.pausedUntil > Date.now();
     if (paused) {
       var secs = Math.ceil((AK.rate.pausedUntil - Date.now()) / 1000);
-      qm.appendChild(h("div", { class: "qpause", text: "Claude asked us to slow down. Resuming in " + secs + "s." }));
+      qm.appendChild(h("div", { class: "qpause", text: "AI provider asked us to slow down. Resuming in " + secs + "s." }));
     }
     var m = AK.$("mode"); m.innerHTML = "";
-    var ok = AK.IN_CLAUDE || !!S.settings.apiKey;
+    var ok = AK.keyReady();
     m.appendChild(h("span", { class: "dot" + (ok ? "" : " off") }));
-    m.appendChild(document.createTextNode(AK.IN_CLAUDE ? "Running inside Claude" : S.settings.apiKey ? "Connected with your API key" : "Add your API key in Settings"));
+    m.appendChild(document.createTextNode(AK.IN_CLAUDE ? "Running inside Claude" : (ok ? (AK.usingGemini() ? "Gemini key saved" : "Claude key saved") : "Add an AI API key in Settings")));
     var sub = AK.$("logoSub"); if (sub) sub.textContent = S.profile.name ? S.profile.name.split(" ")[0] + "'s internship search" : "Internship search";
   };
 
@@ -2377,9 +2419,9 @@ var AK = (function () {
   }
   AK.viewAdd = function (root) {
     var f = S.form;
-    var need = !AK.IN_CLAUDE && !S.settings.apiKey;
+    var need = !AK.keyReady();
     root.appendChild(AK.pageHead("Add a job", "Paste the posting and press Add. Paste the next one while it builds."));
-    if (need) root.appendChild(h("div", { class: "callout bad" }, "Add your Claude API key under ", h("a", { href: "#", onclick: function (e) { e.preventDefault(); AK.go("settings"); }, text: "Me, then Settings" }), " first."));
+    if (need) root.appendChild(h("div", { class: "callout bad" }, "Add your AI API key under ", h("a", { href: "#", onclick: function (e) { e.preventDefault(); AK.go("settings"); }, text: "Me, then Settings" }), " first."));
     if (!S.profile.name) root.appendChild(h("div", { class: "callout" }, "Fill in ", h("a", { href: "#", onclick: function (e) { e.preventDefault(); AK.go("profile"); }, text: "Me" }), " first so drafts are signed and based on your real experience."));
     var posting = h("textarea", { id: "addPosting", class: "doc", style: "min-height:240px", placeholder: "On the posting page press Cmd+A, then Cmd+C, and paste here." });
     AK.bind(posting, f, "posting");
@@ -2395,7 +2437,8 @@ var AK = (function () {
     var extras = h("details", { class: "more", style: "margin-top:12px" }, h("summary", { text: "More options" }),
       h("div", { class: "field", style: "margin-top:10px" }, h("label", { class: "lbl", for: "addSite", text: "Company website" }), website),
       h("div", { class: "field" }, h("label", { class: "lbl", for: "addContact", text: "Someone you'll email" }), contact),
-      h("div", { class: "field" }, h("label", { class: "lbl", for: "addBatch", text: "Paste several postings, separated by ---" }), batchTa),      AK.btn("Add them all", function () {
+      h("div", { class: "field" }, h("label", { class: "lbl", for: "addBatch", text: "Paste several postings, separated by ---" }), batchTa),
+      AK.btn("Add them all", function () {
         var parts = batch.text.split(/\n\s*-{3,}\s*\n/).map(function (s) { return s.trim(); }).filter(function (s) { return s.length >= 80; });
         if (!parts.length) { AK.toast("Separate postings with ---"); return; }
         parts.forEach(function (p) { S.apps.unshift(AK.newApp(p, "", "", "")); });
@@ -3031,36 +3074,60 @@ var AK = (function () {
 
   AK.viewSettings = function (root, bar) {
     var s = S.settings;
-    root.appendChild(AK.pageHead("Me", AK.IN_CLAUDE ? "This copy runs inside Claude, so it doesn't need an API key." : "This copy runs on its own website and uses your own Claude API key."));
+    root.appendChild(AK.pageHead("Me", AK.IN_CLAUDE ? "This copy runs inside Claude, so it doesn't need an API key." : "Choose a free Gemini model or use your own Claude API key."));
     if (bar) root.appendChild(bar);
     var cols = h("div", { class: "cols" });
     if (!AK.IN_CLAUDE) {
-      var key = h("input", { type: "password", id: "setKey", placeholder: "sk-ant-…", autocomplete: "off" }); key.value = s.apiKey || "";
+      if (!s.provider) s.provider = s.apiKey ? "claude" : "gemini";
+      var gemini = s.provider === "gemini";
+      var provider = h("select", { id: "setProvider" },
+        h("option", { value: "gemini", text: "Google Gemini (free tier)" }),
+        h("option", { value: "claude", text: "Anthropic Claude (paid API)" }));
+      provider.value = gemini ? "gemini" : "claude";
+      provider.addEventListener("change", function () {
+        s.provider = provider.value;
+        AK.store.set(AK.KEYS.settings, s).then(function () { AK.render(); });
+      });
+      var keyName = gemini ? "geminiKey" : "apiKey";
+      var key = h("input", { type: "password", id: "setKey", placeholder: gemini ? "AIza…" : "sk-ant-…", autocomplete: "off" });
+      key.value = s[keyName] || "";
+      var modelName = gemini ? "geminiModel" : "model";
+      var options = gemini ? AK.GEMINI_MODELS : AK.MODELS;
       var msg = h("p", { class: "small muted", role: "status" });
-      var model = h("select", { id: "setModel" }, AK.MODELS.map(function (m) { var o = h("option", { value: m[0], text: m[1] }); if (m[0] === s.model) o.selected = true; return o; }));
-      model.addEventListener("change", function () { s.model = model.value; AK.store.set(AK.KEYS.settings, s); });
-      cols.appendChild(h("section", { class: "panel" }, h("div", { class: "panel-h" }, h("h2", { text: "Claude API key" })),
+      var model = h("select", { id: "setModel" }, options.map(function (m) {
+        var o = h("option", { value: m[0], text: m[1] });
+        if (m[0] === (s[modelName] || options[0][0])) o.selected = true;
+        return o;
+      }));
+      model.addEventListener("change", function () { s[modelName] = model.value; AK.store.set(AK.KEYS.settings, s); });
+      cols.appendChild(h("section", { class: "panel" }, h("div", { class: "panel-h" }, h("h2", { text: gemini ? "Free Gemini API" : "Claude API" })),
+        h("div", { class: "field" }, h("label", { class: "lbl", for: "setProvider", text: "AI provider" }), provider),
         h("div", { class: "field" }, h("label", { class: "lbl", for: "setKey", text: "API key" }),
-          h("p", { class: "hint" }, "Create one at ", h("a", { href: "https://platform.claude.com/settings/keys", target: "_blank", rel: "noopener noreferrer", text: "platform.claude.com/settings/keys" }), ". Set a monthly spend limit on the Billing page first."), key),
+          gemini ? h("p", { class: "hint" }, "Get a free-tier key from ", h("a", { href: "https://aistudio.google.com/api-keys", target: "_blank", rel: "noopener noreferrer", text: "Google AI Studio" }), ". You do not need to enable paid billing to use the free tier.") :
+            h("p", { class: "hint" }, "Create a paid API key at ", h("a", { href: "https://platform.claude.com/settings/keys", target: "_blank", rel: "noopener noreferrer", text: "Claude Console" }), ". Set a spend limit first."), key),
         h("div", { class: "field" }, h("label", { class: "lbl", for: "setModel", text: "Model" }), model),
         h("div", { class: "row" },
-          AK.btn("Save key", function () { s.apiKey = key.value.trim(); AK.store.set(AK.KEYS.settings, s).then(function () { AK.renderNav(); AK.toast(s.apiKey ? "Key saved" : "Key removed"); }); }, { cls: "primary" }),
-          AK.btn("Test connection", function () { s.apiKey = key.value.trim(); msg.textContent = "Testing…";
-            AK.callClaude({ system: "Reply with the word ok.", user: "ok?", maxTokens: 16 }).then(function () { msg.textContent = "Connected. You're ready to build jobs."; }).catch(function (e) { msg.textContent = e.message; }); }),
-          AK.btn("Forget key", function () { s.apiKey = ""; key.value = ""; AK.store.set(AK.KEYS.settings, s).then(function () { AK.renderNav(); AK.toast("Key removed from this browser"); }); }, { cls: "ghost" })),
-        msg, h("p", { class: "small muted", text: "The key stays in this browser and is sent only to Anthropic. Never put it in a file on GitHub." })));
+          AK.btn("Save key", function () { s[keyName] = key.value.trim(); AK.store.set(AK.KEYS.settings, s).then(function () { AK.renderNav(); AK.toast(s[keyName] ? "Key saved" : "Key removed"); }); }, { cls: "primary" }),
+          AK.btn("Test connection", function () { s[keyName] = key.value.trim(); msg.textContent = "Testing…";
+            AK.callClaude({ system: "Reply with the word ok.", user: "ok?", maxTokens: 48 }).then(function () { msg.textContent = "Connected. You're ready to draft applications."; }).catch(function (e) { msg.textContent = e.message; }); }),
+          AK.btn("Forget key", function () { s[keyName] = ""; key.value = ""; AK.store.set(AK.KEYS.settings, s).then(function () { AK.renderNav(); AK.toast("Key removed from this browser"); }); }, { cls: "ghost" })),
+        msg,
+        gemini ? h("p", { class: "small muted" }, "Free Gemini creates drafts from the postings you paste, but does not provide verified live web research. Free-tier text may be used to improve Google's products. Your key is stored only in this browser; using it here is for personal testing, not a secure public production deployment.") :
+          h("p", { class: "small muted", text: "The key stays in this browser and is sent to Anthropic. Never commit it to GitHub." })));
     }
     var conc = h("select", { id: "setConc" }, [1, 2, 3].map(function (n) { var o = h("option", { value: String(n), text: n === 1 ? "1 at a time (steadiest)" : n + " at a time" }); if (n === Number(s.concurrency)) o.selected = true; return o; }));
     conc.addEventListener("change", function () { s.concurrency = Number(conc.value); AK.store.set(AK.KEYS.settings, s); AK.pump(); });
     var rs = h("input", { type: "checkbox", id: "setResearch" }); rs.checked = s.research !== false;
+    rs.disabled = !AK.canWebResearch();
+    if (rs.disabled) rs.checked = false;
     rs.addEventListener("change", function () { s.research = rs.checked; AK.store.set(AK.KEYS.settings, s); });
     cols.appendChild(h("section", { class: "panel" }, h("div", { class: "panel-h" }, h("h2", { text: "Building" })),
       h("div", { class: "field" }, h("label", { class: "toggle", for: "setResearch" }, rs, "Research each job on the web"),
-        h("p", { class: "hint", style: "margin-top:6px", text: "Finds who to email, the typical reply time and how they hire. Company, city and housing research run when you open Prepare or Plan." })),
+        h("p", { class: "hint", style: "margin-top:6px", text: AK.usingGemini() ? "Unavailable with Gemini's free tier. Drafting, fit analysis and application answers work with pasted postings. Switch to a research-enabled provider for verified web information." : "Finds who to email, the typical reply time and how they hire. Company, city and housing research run when you open Prepare or Plan." })),
       h("div", { class: "field" }, h("label", { class: "lbl", for: "setConc", text: "Jobs to build at the same time" }), conc,
-        h("p", { class: "hint", style: "margin-top:6px", text: "Shortlist slows itself down if Claude gets busy, so you rarely need to change this." })),
+        h("p", { class: "hint", style: "margin-top:6px", text: "Shortlist limits concurrent AI calls to reduce rate-limit errors." })),
       h("div", { class: "field" }, h("div", { class: "lbl", text: "Your data" }),
-        h("p", { class: "hint", text: "Your profile and applications stay in this " + (AK.IN_CLAUDE ? "app" : "browser") + ". Text is sent to Claude only while a draft or research is being written." }),
+        h("p", { class: "hint", text: "Your profile and applications stay in this " + (AK.IN_CLAUDE ? "app" : "browser") + ". Draft text is sent to the selected AI provider when you build or rewrite a job." }),
         h("div", { class: "row" }, AK.armed("Delete all saved data", "Click again to delete everything", function () {
           S.profile = Object.assign({}, AK.DEFAULT_PROFILE); S.apps = [];
           Promise.all([AK.store.set(AK.KEYS.profile, S.profile), AK.saveApps()]).then(function () { AK.toast("All data deleted"); AK.go("dashboard"); });
@@ -3085,7 +3152,13 @@ var AK = (function () {
     }
     else if (pre) { S.profile = Object.assign({}, AK.DEFAULT_PROFILE, pre); AK.store.set(AK.KEYS.profile, S.profile); }
     else if (res[0]) S.profile = Object.assign({}, AK.DEFAULT_PROFILE, res[0]);
-    if (res[1]) { var keep = AK.IN_CLAUDE ? { apiKey: "" } : {}; S.settings = Object.assign(S.settings, res[1], keep); }
+    if (res[1]) {
+      var saved = res[1];
+      // Existing users who already saved a Claude key keep Claude selected until they choose Gemini.
+      if (!saved.provider) saved.provider = saved.apiKey ? "claude" : "gemini";
+      var keep = AK.IN_CLAUDE ? { apiKey: "", geminiKey: "" } : {};
+      S.settings = Object.assign(S.settings, saved, keep);
+    }
     if (Array.isArray(res[2])) S.apps = res[2].map(AK.normalizeApp);
     AK.render();
   });
