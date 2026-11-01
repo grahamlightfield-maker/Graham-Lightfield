@@ -516,11 +516,20 @@ var AK = (function () {
     ["gemini-3.8-flash", "Gemini 3.8 Flash (free tier, recommended)"],
     ["gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (free tier, lighter)"]
   ];
+  AK.OPENROUTER_MODELS = [
+    ["nvidia/nemotron-3-ultra-550b-a55b:free", "NVIDIA Nemotron 3 Ultra (free)"],
+    ["openrouter/free", "OpenRouter free auto-router"]
+  ];
   AK.usingGemini = function () { return !AK.IN_CLAUDE && AK.state.settings.provider === "gemini"; };
-  AK.keyReady = function () { return AK.IN_CLAUDE || (AK.usingGemini() ? !!AK.state.settings.geminiKey : !!AK.state.settings.apiKey); };
-  AK.canWebResearch = function () { return !AK.usingGemini(); };
+  AK.usingOpenRouter = function () { return !AK.IN_CLAUDE && AK.state.settings.provider === "openrouter"; };
+  AK.keyReady = function () {
+    if (AK.IN_CLAUDE) return true;
+    if (AK.usingOpenRouter()) return !!AK.state.settings.openrouterKey;
+    return AK.usingGemini() ? !!AK.state.settings.geminiKey : !!AK.state.settings.apiKey;
+  };
+  AK.canWebResearch = function () { return !AK.usingGemini() && !AK.usingOpenRouter(); };
   AK.KEYS = { profile: "kit-profile", settings: "kit-settings", apps: "kit-apps" };
-  AK.GEMINI_HOME_REV = "gemini-home-v2";
+  AK.GEMINI_HOME_REV = "openrouter-home-v1";
   AK.STATUSES = ["Saved", "Applied", "Emailed", "Follow-up sent", "Interviewing", "Offer", "Rejected", "Closed"];
 
   AK.store = {
@@ -551,7 +560,7 @@ var AK = (function () {
   };
   AK.state = {
     profile: Object.assign({}, AK.DEFAULT_PROFILE),
-    settings: { provider: "gemini", geminiKey: "", geminiModel: AK.GEMINI_MODELS[0][0], apiKey: "", model: AK.MODELS[0][0], research: true, living: true, intel: true, contact: true, concurrency: AK.IN_CLAUDE ? 1 : 2 },
+    settings: { provider: "openrouter", openrouterKey: "", openrouterModel: AK.OPENROUTER_MODELS[0][0], geminiKey: "", geminiModel: AK.GEMINI_MODELS[0][0], apiKey: "", model: AK.MODELS[0][0], research: true, living: true, intel: true, contact: true, concurrency: AK.IN_CLAUDE ? 1 : 2 },
     apps: [],
     route: { view: "dashboard", id: null, tab: "apply" },
     form: { posting: "", link: "", website: "", contact: "", showContact: false },
@@ -739,7 +748,58 @@ var AK = (function () {
         return { text: result, sources: [], stop: candidate && candidate.finishReason, blocks: parts };
       }); });
   }
+  function sendOpenRouter(opts) {
+    var s = AK.state.settings;
+    if (!s.openrouterKey) return Promise.reject(new UserError("Add your OpenRouter key in Me > Settings first."));
+    if (opts.search) return Promise.reject(new UserError("OpenRouter's free model cannot browse job listings automatically. Paste the actual job description or connect a separate search service."));
+    var selected = AK.OPENROUTER_MODELS.some(function (m) { return m[0] === s.openrouterModel; }) ? s.openrouterModel : AK.OPENROUTER_MODELS[0][0];
+    var body = {
+      model: selected,
+      messages: [
+        { role: "system", content: opts.system || "You are a helpful internship application assistant. Never invent qualifications." },
+        { role: "user", content: opts.user || "" }
+      ],
+      max_tokens: Math.max(4096, Math.min(8192, opts.maxTokens || 2000)),
+      temperature: 0.3,
+      stream: false
+    };
+    return fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + s.openrouterKey,
+        "HTTP-Referer": "https://grahamlightfield-maker.github.io/ShortlistApplicationCreator/",
+        "X-Title": "Shortlist"
+      },
+      body: JSON.stringify(body)
+    }).catch(function () { throw new UserError("Can't reach OpenRouter. Check your internet connection and browser settings."); })
+      .then(function (res) {
+        return res.json().catch(function () { return null; }).then(function (data) {
+          if (!res.ok) {
+            var detail = (data && data.error && (data.error.message || data.error.code)) || "";
+            var friendly = res.status === 401 ? "OpenRouter rejected this API key. Create a new key and save it in Settings." :
+              res.status === 402 ? "OpenRouter requested payment or credits for this request. Select a free model." :
+              res.status === 404 ? "The free model is temporarily unavailable. Try the OpenRouter free auto-router." :
+              res.status === 429 ? "OpenRouter's free request limit was reached. Try later." :
+              "OpenRouter returned error " + res.status + ". " + detail;
+            var err = new UserError(friendly);
+            if (res.status === 429 || res.status === 503) {
+              err.rateLimited = true;
+              var ra = parseFloat(res.headers.get("retry-after"));
+              err.retryAfter = isFinite(ra) ? ra : null;
+            }
+            throw err;
+          }
+          var choice = data && data.choices && data.choices[0];
+          var reply = choice && choice.message && choice.message.content;
+          var result = typeof reply === "string" ? reply : (Array.isArray(reply) ? reply.filter(function (p) { return p && p.type === "text"; }).map(function (p) { return p.text; }).join("\\n") : "");
+          if (!result.trim()) throw new UserError("OpenRouter returned no answer. Try again, or select its free auto-router in Settings.");
+          return { text: result, sources: [], stop: choice && choice.finish_reason, blocks: [] };
+        });
+      });
+  }
   function send(opts) {
+    if (AK.usingOpenRouter()) return sendOpenRouter(opts);
     if (AK.usingGemini()) return sendGemini(opts);
     var s = AK.state.settings;
     var headers = { "Content-Type": "application/json" };
@@ -2292,7 +2352,7 @@ var AK = (function () {
     var m = AK.$("mode"); m.innerHTML = "";
     var ok = AK.keyReady();
     m.appendChild(h("span", { class: "dot" + (ok ? "" : " off") }));
-    m.appendChild(document.createTextNode(AK.IN_CLAUDE ? "Running inside Claude" : (ok ? (AK.usingGemini() ? "Gemini connected" : "Claude key saved") : (AK.usingGemini() ? "Connect free Gemini in Me → Settings" : "Connect your Claude key in Me → Settings"))));
+    m.appendChild(document.createTextNode(AK.IN_CLAUDE ? "Running inside Claude" : (ok ? (AK.usingGemini() ? "Gemini connected" : "Claude key saved") : (AK.usingGemini() ? "Connect free OpenRouter in Me → Settings" : "Connect your Claude key in Me → Settings"))));
     var sub = AK.$("logoSub"); if (sub) sub.textContent = S.profile.name ? S.profile.name.split(" ")[0] + "'s internship search" : "Internship search";
   };
 
@@ -3075,25 +3135,27 @@ var AK = (function () {
 
   AK.viewSettings = function (root, bar) {
     var s = S.settings;
-    root.appendChild(AK.pageHead("Me", AK.IN_CLAUDE ? "This copy runs inside Claude, so it doesn't need an API key." : "Free Gemini edition. Google Gemini is the default; no paid Claude API key required."));
+    root.appendChild(AK.pageHead("Me", AK.IN_CLAUDE ? "This copy runs inside Claude, so it doesn't need an API key." : "Free OpenRouter edition. NVIDIA Nemotron 3 Ultra is the default; no paid Claude API key required."));
     if (bar) root.appendChild(bar);
     var cols = h("div", { class: "cols" });
     if (!AK.IN_CLAUDE) {
-      if (!s.provider) s.provider = "gemini";
+      if (!s.provider) s.provider = "openrouter";
       var gemini = s.provider === "gemini";
+      var openrouter = s.provider === "openrouter";
       var provider = h("select", { id: "setProvider" },
+        h("option", { value: "openrouter", text: "OpenRouter (free NVIDIA Nemotron)" }),
         h("option", { value: "gemini", text: "Google Gemini (free tier)" }),
         h("option", { value: "claude", text: "Anthropic Claude (paid API)" }));
-      provider.value = gemini ? "gemini" : "claude";
+      provider.value = s.provider;
       provider.addEventListener("change", function () {
         s.provider = provider.value;
         AK.store.set(AK.KEYS.settings, s).then(function () { AK.render(); });
       });
-      var keyName = gemini ? "geminiKey" : "apiKey";
-      var key = h("input", { type: "password", id: "setKey", placeholder: gemini ? "AIza…" : "sk-ant-…", autocomplete: "off" });
+      var keyName = openrouter ? "openrouterKey" : (gemini ? "geminiKey" : "apiKey");
+      var key = h("input", { type: "password", id: "setKey", placeholder: openrouter ? "sk-or-v1-…" : (gemini ? "AIza…" : "sk-ant-…"), autocomplete: "off" });
       key.value = s[keyName] || "";
-      var modelName = gemini ? "geminiModel" : "model";
-      var options = gemini ? AK.GEMINI_MODELS : AK.MODELS;
+      var modelName = openrouter ? "openrouterModel" : (gemini ? "geminiModel" : "model");
+      var options = openrouter ? AK.OPENROUTER_MODELS : (gemini ? AK.GEMINI_MODELS : AK.MODELS);
       var msg = h("p", { class: "small muted", role: "status" });
       var model = h("select", { id: "setModel" }, options.map(function (m) {
         var o = h("option", { value: m[0], text: m[1] });
@@ -3101,9 +3163,10 @@ var AK = (function () {
         return o;
       }));
       model.addEventListener("change", function () { s[modelName] = model.value; AK.store.set(AK.KEYS.settings, s); });
-      cols.appendChild(h("section", { class: "panel" }, h("div", { class: "panel-h" }, h("h2", { text: gemini ? "Free Gemini API" : "Claude API" })),
+      cols.appendChild(h("section", { class: "panel" }, h("div", { class: "panel-h" }, h("h2", { text: openrouter ? "Free OpenRouter API" : (gemini ? "Free Gemini API" : "Claude API") })),
         h("div", { class: "field" }, h("label", { class: "lbl", for: "setProvider", text: "AI provider" }), provider),
         h("div", { class: "field" }, h("label", { class: "lbl", for: "setKey", text: "API key" }),
+          openrouter ? h("p", { class: "hint" }, "Get your key from ", h("a", { href: "https://openrouter.ai/settings/keys", target: "_blank", rel: "noopener noreferrer", text: "OpenRouter" }), ". Select NVIDIA Nemotron (free) to avoid paid model charges. Don't share your key.") :
           gemini ? h("p", { class: "hint" }, "Get a free-tier key from ", h("a", { href: "https://aistudio.google.com/api-keys", target: "_blank", rel: "noopener noreferrer", text: "Google AI Studio" }), ". You do not need to enable paid billing to use the free tier.") :
             h("p", { class: "hint" }, "Create a paid API key at ", h("a", { href: "https://platform.claude.com/settings/keys", target: "_blank", rel: "noopener noreferrer", text: "Claude Console" }), ". Set a spend limit first."), key),
         h("div", { class: "field" }, h("label", { class: "lbl", for: "setModel", text: "Model" }), model),
@@ -3113,6 +3176,7 @@ var AK = (function () {
             AK.callClaude({ system: "Reply with the word ok.", user: "ok?", maxTokens: 48 }).then(function () { msg.textContent = "Connected. You're ready to draft applications."; }).catch(function (e) { msg.textContent = e.message; }); }),
           AK.btn("Forget key", function () { s[keyName] = ""; key.value = ""; AK.store.set(AK.KEYS.settings, s).then(function () { AK.renderNav(); AK.toast("Key removed from this browser"); }); }, { cls: "ghost" })),
         msg,
+        openrouter ? h("p", { class: "small muted" }, "OpenRouter free models generate drafts from pasted job postings and do not search live job websites. Free NVIDIA inference may log prompts to improve its services. Avoid entering confidential information. This personal-use key is stored in your browser, which is not secure for a public multi-user service.") :
         gemini ? h("p", { class: "small muted" }, "Free Gemini creates drafts from the postings you paste, but does not provide verified live web research. Free-tier text may be used to improve Google's products. Your key is stored only in this browser; using it here is for personal testing, not a secure public production deployment.") :
           h("p", { class: "small muted", text: "The key stays in this browser and is sent to Anthropic. Never commit it to GitHub." })));
     }
@@ -3124,7 +3188,7 @@ var AK = (function () {
     rs.addEventListener("change", function () { s.research = rs.checked; AK.store.set(AK.KEYS.settings, s); });
     cols.appendChild(h("section", { class: "panel" }, h("div", { class: "panel-h" }, h("h2", { text: "Building" })),
       h("div", { class: "field" }, h("label", { class: "toggle", for: "setResearch" }, rs, "Research each job on the web"),
-        h("p", { class: "hint", style: "margin-top:6px", text: AK.usingGemini() ? "Unavailable with Gemini's free tier. Drafting, fit analysis and application answers work with pasted postings. Switch to a research-enabled provider for verified web information." : "Finds who to email, the typical reply time and how they hire. Company, city and housing research run when you open Prepare or Plan." })),
+        h("p", { class: "hint", style: "margin-top:6px", text: !AK.canWebResearch() ? "Unavailable with the current free-model providers. Drafting, fit analysis and application answers work with pasted postings. To research live listings, Shortlist needs a separate search integration." : "Finds who to email, the typical reply time and how they hire. Company, city and housing research run when you open Prepare or Plan." })),
       h("div", { class: "field" }, h("label", { class: "lbl", for: "setConc", text: "Jobs to build at the same time" }), conc,
         h("p", { class: "hint", style: "margin-top:6px", text: "Shortlist limits concurrent AI calls to reduce rate-limit errors." })),
       h("div", { class: "field" }, h("div", { class: "lbl", text: "Your data" }),
@@ -3155,16 +3219,16 @@ var AK = (function () {
     else if (res[0]) S.profile = Object.assign({}, AK.DEFAULT_PROFILE, res[0]);
     if (res[1]) {
       var saved = res[1];
-      // Migrate the older Claude-only website into the free Gemini edition exactly once.
+      // Default existing browser settings to the OpenRouter free edition once.
       // This changes only the selected provider, not the profile, jobs, or saved keys.
       // Future manual provider changes persist after the migration.
       if (!AK.IN_CLAUDE && saved.geminiHomeRevision !== AK.GEMINI_HOME_REV) {
-        saved.provider = "gemini";
+        saved.provider = "openrouter";
         saved.geminiHomeRevision = AK.GEMINI_HOME_REV;
         AK.store.set(AK.KEYS.settings, saved);
       }
-      if (!saved.provider) saved.provider = "gemini";
-      var keep = AK.IN_CLAUDE ? { apiKey: "", geminiKey: "" } : {};
+      if (!saved.provider) saved.provider = "openrouter";
+      var keep = AK.IN_CLAUDE ? { apiKey: "", geminiKey: "", openrouterKey: "" } : {};
       S.settings = Object.assign(S.settings, saved, keep);
     }
     if (Array.isArray(res[2])) S.apps = res[2].map(AK.normalizeApp);
